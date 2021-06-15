@@ -1,0 +1,243 @@
+--- # install k8s cluster with kubeadm
+- hosts: k8s-cluster
+  become: yes
+  vars:
+    sysctl_file: /etc/sysctl.d/k8s.conf
+  tasks:
+    - name: load br_netfilter
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: configure br_netfilter for boot time
+      copy:
+        content: br_netfilter
+        dest: /etc/modules-load.d/k8s.conf
+
+    - name: configure bridged traffic-ipv6
+      sysctl:
+        name: net.bridge.bridge-nf-call-ip6tables
+        value: '1'
+        sysctl_file: "{{sysctl_file}}"
+        sysctl_set: yes
+        reload: yes
+
+    - name: configure bridged traffic-ipv4
+      sysctl:
+        name: net.bridge.bridge-nf-call-iptables
+        value: '1'
+        sysctl_set: yes
+        reload: yes
+
+    - name: remove older version of docker
+      apt:
+       pkg:
+         - docker
+         - docker-engine
+         - docker.io
+         - containerd
+         - runc
+       state: absent
+
+    - name: install required packages for docker
+      apt:
+        pkg:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: latest
+        update_cache: yes
+        force_apt_get: yes
+
+    - name: configure docker gpg key
+      apt_key:
+        url: "https://download.docker.com/linux/ubuntu/gpg"
+        keyring: /usr/share/keyrings/docker-archive-keyring.gpg
+        state: present
+
+    - name: add docker repo
+      apt_repository: 
+        repo: "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu/ {{ansible_distribution_release}} stable"
+        state: present
+        update_cache: true
+
+    - name: install docker engine
+      apt:
+        pkg:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: latest
+        update_cache: yes
+
+    - name: create docker directory
+      file:
+        path: "/etc/docker"
+        state: directory
+
+    - name: configure docker dameon
+      copy:
+        content: |
+            {
+             "exec-opts": ["native.cgroupdriver=systemd"],
+               "log-driver": "json-file",
+               "log-opts": {
+                  "max-size": "100m"
+               },
+             "storage-driver": "overlay2"
+            }
+        dest: /etc/docker/daemon.json
+
+    - name: create systemd docker.service directory
+      file:
+        path: "/etc/systemd/system/docker.service.d/"
+        state: directory
+
+    - name: configure systemd for docker
+      copy:
+        content: |
+          [Service]
+          ExecStart=
+          ExecStart=/usr/bin/dockerd
+        dest: /etc/systemd/system/docker.service.d/docker.conf
+
+    - name: enable and start docker service
+      systemd:
+        name: docker
+        daemon_reload: yes
+        state: started
+        enabled: yes
+      async: 10
+      poll: 0
+      
+    - name: install required packages kubeadm-kubectl-kubelet
+      apt:
+        pkg:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+        state: latest
+        update_cache: yes
+
+    # https://github.com/ansible/ansible/issues/74424
+    # - name: add Google Cloud public signing key
+    #   apt_key:
+    #     url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+    #     keyring: /usr/share/keyrings/kubernetes-archive-keyring.gpg
+    #     state: present
+    #     validate_certs: no
+
+    - name: download Google Cloud public signing key
+      command: sudo curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg
+  
+    - name: add kubernetes repo
+      apt_repository:
+        repo:  "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main"
+        state: present
+        update_cache: true
+
+    - name: install kubeadm-kubectl-kubelet
+      apt:
+        pkg:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: latest
+        update_cache: yes
+
+    - name: mark hold for packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubeadm
+        - kubelet
+        - kubectl
+
+    - name: enable and start k8s service
+      systemd:
+        name: kubelet
+        daemon_reload: yes
+        state: restarted
+        enabled: yes
+      async: 10
+      poll: 0
+
+    - name: disable swap
+      command: swapoff -a
+
+    - name: remove swap from fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: 'swap'
+        state: absent
+
+- hosts: k8s-masters
+  become: yes
+  tasks:
+    - name: check if k8s already initilized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: result
+
+    - name: initialize kubeadm
+      command: kubeadm init --pod-network-cidr=192.168.240.100/24
+      run_once: True
+      when: not result.stat.exists 
+
+    - name: configure kubeconfig
+      shell: |
+        mkdir -p /home/ibrahim/.kube
+        cp -i /etc/kubernetes/admin.conf /home/ibrahim/.kube/config
+        chown ibrahim:ibrahim /home/ibrahim/.kube/config
+      async: 10
+      poll: 0
+
+    - name: install flannel cni add-on
+      command: kubectl apply --kubeconfig /etc/kubernetes/admin.conf -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml 
+    
+    - name: get cluster token for join
+      command: kubeadm token create --print-join-command
+      register: join_token
+
+    - name: set token to facts
+      set_fact:
+        kubeadm_join: "{{ join_token.stdout }}"
+        cacheable: yes
+        
+- hosts: k8s-nodes
+  become: yes
+  tasks:
+    - name: check already joined
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: is_joined
+
+    - name: run join command
+      command: "{{ hostvars['k8s-master']['ansible_facts']['kubeadm_join'] }}"
+      when: not is_joined.stat.exists
+
+- hosts: k8s-masters
+  become: yes
+  tasks:
+    - name: copy kubeconfig to local
+      fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: /Users/ibrahim/.kube/lab.conf
+        flat: yes
+
+- hosts: localhost
+  tasks:
+    - name: check KUBECONFIG is already appened
+      lineinfile:
+        path: "{{ ansible_env.HOME }}/.zshrc"
+        regexp: lab.conf
+      check_mode: true
+      register: presence
+      failed_when: presence is changed
+    - name: set KUBECONFIG env
+      shell: |
+        echo 'export KUBECONFIG=$KUBECONFIG:$HOME/.kube/lab.conf' >> $HOME/.zshrc
+      when: presence is not changed
