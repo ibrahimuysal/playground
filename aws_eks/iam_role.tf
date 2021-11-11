@@ -41,3 +41,21 @@ resource "aws_iam_role" "node_group" {
     Name = "eks-node-group-role"
   }
 }
+
+resource "aws_iam_role" "fargate_role" {
+  name = "eks-fargate-profile"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Sid    = ""
+        Principal = {
+          Service = "eks-fargate-pods.amazonaws.com"
+        }
+      },
+    ]
+  })
+}
