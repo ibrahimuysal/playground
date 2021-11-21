@@ -1,0 +1,19 @@
+# Local .terraform directories
+**/.terraform/*
+
+# Local Lock files
+**/.terraform.*
+
+# .tfstate files
+*.tfstate
+*.tfstate.*
+
+# Ignore CLI configuration files
+.terraformrc
+terraform.rc
+
+# Ignore  tfvars files
+terraform.tfvars
+
+# Ignore kubectl config files
+kubeconfig/*
